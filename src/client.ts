@@ -51,6 +51,19 @@ export class CanvasClient {
   }
 
   /**
+   * Download a file from a fully-qualified presigned URL (e.g. Canvas S3 URLs).
+   * Does NOT send the Authorization header — presigned URLs are self-authenticating
+   * and sending auth to S3 causes a 400 "Conflicting Authorization" error.
+   */
+  async download(url: string): Promise<Buffer> {
+    const res = await axios.get<ArrayBuffer>(url, {
+      responseType: "arraybuffer",
+      timeout: 60_000,
+    });
+    return Buffer.from(res.data);
+  }
+
+  /**
    * Fetch a URL directly (used for next-page URLs returned by Canvas
    * which are fully-qualified, not relative to baseURL).
    */

@@ -17,6 +17,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { CanvasClient, handleApiError } from "./client.js";
+import { extractFileContent } from "./extractor.js";
 
 // ---------------------------------------------------------------------------
 // Config & shared client
@@ -66,6 +67,20 @@ function fmtDate(iso: string | null | undefined): string {
     minute: "2-digit",
     timeZoneName: "short",
   });
+}
+
+/** Strip HTML tags and decode common entities to plain text. */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Format bytes into KB/MB. */
@@ -858,10 +873,6 @@ Examples:
         };
       }
 
-      // Strip basic HTML tags for readable text
-      const stripHtml = (html: string) =>
-        html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-
       const announcements = result.items.map((a) => ({
         id: a.id,
         title: a.title,
@@ -1052,6 +1063,564 @@ Examples:
       }
 
       return { content: [{ type: "text", text: truncate(lines.join("\n")) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: handleApiError(err) }] };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: canvas_get_course_modules
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "canvas_get_course_modules",
+  {
+    title: "Get Course Modules",
+    description: `List the modules (units) in a course and all items within each module.
+
+Args:
+  - course_id (string): Canvas course ID (required) — get from canvas_list_courses
+  - response_format ('markdown' | 'json')
+
+Returns:
+  Each module with its items: title, type (File, Page, Assignment, Quiz, Discussion, etc.),
+  content_id, and page_url (for Page items — needed by canvas_get_page_content).
+
+Examples:
+  - "What units are in my Finance course?" → course_id='...'
+  - "What's in Module 3?" → use this first to get item IDs, then fetch content
+  - "Show me all the files and pages for the midterm unit" → use this to find them`,
+    inputSchema: z.object({
+      course_id: z.string().describe("Canvas course ID"),
+      response_format: z.nativeEnum(Fmt).default(Fmt.Markdown),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async (params) => {
+    try {
+      const result = await canvas.getPaginated<Record<string, unknown>>(
+        `/courses/${params.course_id}/modules`,
+        { "include[]": "items", per_page: 50 }
+      );
+
+      if (!result.items.length) {
+        return {
+          content: [{ type: "text", text: "No modules found. The course may not use modules." }],
+        };
+      }
+
+      // If a module's inline items were truncated, fetch the rest via items_url
+      const modules = await Promise.all(
+        result.items.map(async (mod) => {
+          const inlineItems = (mod.items as Array<Record<string, unknown>>) ?? [];
+          const itemsCount = Number(mod.items_count ?? inlineItems.length);
+          let items = inlineItems;
+
+          if (itemsCount > inlineItems.length && mod.items_url) {
+            try {
+              const full = await canvas.getUrl<Record<string, unknown>>(
+                String(mod.items_url)
+              );
+              items = full.items;
+            } catch {
+              // use inline items as fallback
+            }
+          }
+
+          return {
+            id: mod.id,
+            name: mod.name,
+            position: mod.position,
+            items_count: itemsCount,
+            items: items.map((item) => ({
+              id: item.id,
+              title: item.title,
+              type: item.type,
+              content_id: item.content_id ?? null,
+              page_url: item.page_url ?? null,
+            })),
+          };
+        })
+      );
+
+      if (params.response_format === Fmt.JSON) {
+        return {
+          content: [{ type: "text", text: truncate(JSON.stringify(modules, null, 2)) }],
+          structuredContent: { modules, has_more: result.hasMore },
+        };
+      }
+
+      const lines = [
+        `# Course Modules — Course ${params.course_id}`,
+        `${modules.length}${result.hasMore ? "+" : ""} module(s)`,
+        "",
+      ];
+      for (const mod of modules) {
+        lines.push(`## ${mod.name}`);
+        for (const item of mod.items) {
+          const idNote =
+            item.type === "Page" && item.page_url
+              ? `(page_url: ${item.page_url})`
+              : item.content_id
+              ? `(id: ${item.content_id})`
+              : "";
+          lines.push(`- [${item.type}] ${item.title} ${idNote}`);
+        }
+        lines.push("");
+      }
+      lines.push(
+        "_Use `canvas_get_page_content` for Page items, `canvas_read_file` for File items, or `canvas_get_study_materials` to pull everything at once._"
+      );
+
+      return { content: [{ type: "text", text: truncate(lines.join("\n")) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: handleApiError(err) }] };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: canvas_get_page_content
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "canvas_get_page_content",
+  {
+    title: "Get Canvas Page Content",
+    description: `Get the full plain-text content of a Canvas wiki page (lecture notes, syllabus, unit summaries, etc.).
+
+Args:
+  - course_id (string): Canvas course ID (required)
+  - page_url (string): The page_url slug for the page (required) — get from canvas_get_course_modules
+  - response_format ('markdown' | 'json')
+
+Returns:
+  Page title, last updated date, and full body text (HTML stripped to plain text).
+
+Examples:
+  - "Read the lecture notes for Chapter 3" → course_id='...', page_url='chapter-3-notes'
+  - "What does the syllabus say about grading?" → get page_url from modules first`,
+    inputSchema: z.object({
+      course_id: z.string().describe("Canvas course ID"),
+      page_url: z
+        .string()
+        .describe("Page URL slug — get from canvas_get_course_modules (page_url field)"),
+      response_format: z.nativeEnum(Fmt).default(Fmt.Markdown),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async (params) => {
+    try {
+      const page = await canvas.get<Record<string, unknown>>(
+        `/courses/${params.course_id}/pages/${params.page_url}`
+      );
+
+      const title = String(page.title ?? "Untitled Page");
+      const body = stripHtml(String(page.body ?? ""));
+      const updatedAt = fmtDate(page.updated_at as string | null);
+
+      if (!body) {
+        return { content: [{ type: "text", text: `Page "${title}" has no text content.` }] };
+      }
+
+      if (params.response_format === Fmt.JSON) {
+        const out = { title, updated_at: page.updated_at, body };
+        return {
+          content: [{ type: "text", text: JSON.stringify(out, null, 2) }],
+          structuredContent: out,
+        };
+      }
+
+      const lines = [
+        `# ${title}`,
+        `_Last updated: ${updatedAt}_`,
+        "",
+        truncate(body),
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: handleApiError(err) }] };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: canvas_read_file
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "canvas_read_file",
+  {
+    title: "Read File Content",
+    description: `Download a Canvas course file and extract its text content.
+Supports PDF, PowerPoint (.pptx), Word (.docx), and Excel (.xlsx).
+
+Args:
+  - file_id (string): Canvas file ID (required) — get from canvas_list_course_files or canvas_get_course_modules
+  - response_format ('markdown' | 'json')
+
+Returns:
+  Extracted plain text from the file, capped at ~8,000 characters per file.
+  Unsupported file types (images, videos, zips) return an error message.
+
+Examples:
+  - "Read the Chapter 4 lecture slides" → file_id='...' (PPTX)
+  - "What's in the study guide PDF?" → file_id='...'
+  - "Read the Excel template for the assignment" → file_id='...'`,
+    inputSchema: z.object({
+      file_id: z
+        .string()
+        .describe("Canvas file ID — get from canvas_list_course_files or canvas_get_course_modules"),
+      response_format: z.nativeEnum(Fmt).default(Fmt.Markdown),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params) => {
+    try {
+      const result = await extractFileContent(canvas, params.file_id);
+
+      if (!result.ok) {
+        return { content: [{ type: "text", text: `Error: ${result.reason}` }] };
+      }
+
+      if (params.response_format === Fmt.JSON) {
+        const out = {
+          file_id: params.file_id,
+          file_name: result.fileName,
+          file_type: result.fileType,
+          size_bytes: result.fileSizeBytes,
+          truncated: result.truncated,
+          text: result.text,
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(out, null, 2) }],
+          structuredContent: out,
+        };
+      }
+
+      const lines = [
+        `# ${result.fileName} (${result.fileType})`,
+        `_${fmtSize(result.fileSizeBytes)}_${result.truncated ? " — truncated to 8,000 chars" : ""}`,
+        "",
+        result.text,
+      ];
+      return { content: [{ type: "text", text: truncate(lines.join("\n")) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: handleApiError(err) }] };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: canvas_get_study_materials
+// ---------------------------------------------------------------------------
+
+const FileTypeEnum = z.enum(["pdf", "pptx", "docx", "xlsx", "all"]);
+
+const MIME_FOR_TYPE: Record<string, string[]> = {
+  pdf: ["application/pdf"],
+  pptx: [
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+  ],
+  docx: [
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+  ],
+  xlsx: [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+  ],
+};
+
+server.registerTool(
+  "canvas_get_study_materials",
+  {
+    title: "Get Study Materials",
+    description: `Pull all readable content from a course module for exam prep and study guides.
+
+Fetches files (PDF, PPTX, DOCX, XLSX), Canvas pages, and optionally assignment
+descriptions from a module — all in one call. Give Claude this content and ask it
+to generate a study guide, practice questions, or a summary.
+
+Args:
+  - course_id (string): Canvas course ID (required)
+  - module_search (string): Module name to search for, e.g. "Unit 3", "Midterm", "Chapter 4" (optional — omit to get all modules)
+  - file_types (array): Which file types to extract. Options: 'pdf', 'pptx', 'docx', 'xlsx', 'all' (default: ['all'])
+  - max_files (number): Max files to download and parse, 1–30 (default: 10)
+  - include_pages (boolean): Include Canvas page content like lecture notes (default: true)
+  - include_assignment_descriptions (boolean): Include assignment description text (default: false)
+  - response_format ('markdown' | 'json')
+
+Returns:
+  All extracted content organized by module and item. If the response budget is
+  reached before all items are processed, a note lists remaining file IDs so you
+  can call canvas_read_file individually for each.
+
+Examples:
+  - "Get everything I need to study for the midterm" → module_search='midterm'
+  - "Pull all slides and notes for Unit 3" → module_search='Unit 3'
+  - "Get the PDFs and lecture pages for Chapter 5" → module_search='Chapter 5', file_types=['pdf']`,
+    inputSchema: z.object({
+      course_id: z.string().describe("Canvas course ID"),
+      module_search: z
+        .string()
+        .optional()
+        .describe(
+          "Partial module name to match, e.g. 'Unit 3', 'Midterm', 'Chapter 4'. Omit to include all modules."
+        ),
+      file_types: z
+        .array(FileTypeEnum)
+        .default(["all"])
+        .describe("File types to extract: 'pdf', 'pptx', 'docx', 'xlsx', or 'all'"),
+      max_files: z
+        .number()
+        .int()
+        .min(1)
+        .max(30)
+        .default(10)
+        .describe("Max number of files to download and parse (default: 10)"),
+      include_pages: z
+        .boolean()
+        .default(true)
+        .describe("Include Canvas page content, e.g. lecture notes (default: true)"),
+      include_assignment_descriptions: z
+        .boolean()
+        .default(false)
+        .describe("Include assignment description text (default: false)"),
+      response_format: z.nativeEnum(Fmt).default(Fmt.Markdown),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params) => {
+    try {
+      // --- 1. Fetch all modules with inline items ---
+      const modResult = await canvas.getPaginated<Record<string, unknown>>(
+        `/courses/${params.course_id}/modules`,
+        { "include[]": "items", per_page: 50 }
+      );
+
+      if (!modResult.items.length) {
+        return {
+          content: [{ type: "text", text: "No modules found in this course." }],
+        };
+      }
+
+      // --- 2. Filter by module_search ---
+      const search = params.module_search?.toLowerCase().trim();
+      const matchedModules = search
+        ? modResult.items.filter((m) =>
+            String(m.name ?? "").toLowerCase().includes(search)
+          )
+        : modResult.items;
+
+      if (!matchedModules.length) {
+        const names = modResult.items.map((m) => `"${m.name}"`).join(", ");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No modules matched "${params.module_search}". Available modules: ${names}`,
+            },
+          ],
+        };
+      }
+
+      // --- 3. Collect staged items across matched modules ---
+      type StagedFile = { title: string; content_id: string; module_name: string };
+      type StagedPage = { title: string; page_url: string; module_name: string };
+      type StagedAssignment = { title: string; content_id: string; module_name: string };
+
+      const stagedFiles: StagedFile[] = [];
+      const stagedPages: StagedPage[] = [];
+      const stagedAssignments: StagedAssignment[] = [];
+
+      // Determine which MIME types to accept
+      const acceptedMimes = new Set<string>();
+      const wantAll = params.file_types.includes("all");
+      if (wantAll) {
+        Object.values(MIME_FOR_TYPE).flat().forEach((m) => acceptedMimes.add(m));
+      } else {
+        params.file_types.forEach((ft) => {
+          (MIME_FOR_TYPE[ft] ?? []).forEach((m) => acceptedMimes.add(m));
+        });
+      }
+
+      for (const mod of matchedModules) {
+        const modName = String(mod.name ?? "Unknown Module");
+        let items = (mod.items as Array<Record<string, unknown>>) ?? [];
+
+        // Fetch full items list if truncated
+        const itemsCount = Number(mod.items_count ?? items.length);
+        if (itemsCount > items.length && mod.items_url) {
+          try {
+            const full = await canvas.getUrl<Record<string, unknown>>(String(mod.items_url));
+            items = full.items;
+          } catch {
+            // use inline items
+          }
+        }
+
+        for (const item of items) {
+          const type = String(item.type ?? "");
+          const title = String(item.title ?? "Untitled");
+
+          if (type === "File" && item.content_id) {
+            // We'll filter by MIME type when we fetch metadata — stage all files for now
+            stagedFiles.push({ title, content_id: String(item.content_id), module_name: modName });
+          } else if (type === "Page" && item.page_url && params.include_pages) {
+            stagedPages.push({ title, page_url: String(item.page_url), module_name: modName });
+          } else if (type === "Assignment" && item.content_id && params.include_assignment_descriptions) {
+            stagedAssignments.push({ title, content_id: String(item.content_id), module_name: modName });
+          }
+        }
+      }
+
+      // Apply max_files cap
+      const cappedFiles = stagedFiles.slice(0, params.max_files);
+      const skippedFiles = stagedFiles.slice(params.max_files);
+
+      // --- 4. Process sequentially (never parallel — avoids hammering Canvas) ---
+      const BUDGET = 20_000;
+      const PAGE_CAP = 3_000;
+      const ASSIGNMENT_CAP = 1_500;
+
+      let totalChars = 0;
+      let budgetReached = false;
+      const remainingIds: string[] = [];
+      const sections: string[] = [];
+
+      // Helper to append a section and track budget
+      const append = (text: string): boolean => {
+        if (totalChars >= BUDGET) return false;
+        sections.push(text);
+        totalChars += text.length;
+        return true;
+      };
+
+      // Process files
+      for (const staged of cappedFiles) {
+        if (totalChars >= BUDGET) {
+          remainingIds.push(staged.content_id);
+          budgetReached = true;
+          continue;
+        }
+
+        const result = await extractFileContent(canvas, staged.content_id);
+
+        if (!result.ok) {
+          append(`### ${staged.title}\n_Skipped: ${result.reason}_\n`);
+          continue;
+        }
+
+        // Filter by accepted MIME types (we only know the type after fetching metadata)
+        if (!acceptedMimes.has(
+          // Re-check: ExtractSuccess always has fileType, map back to mime check via name
+          // We use a simpler approach: acceptedMimes check was already done by staged filtering
+          // but since we stage all and filter by mime later, check now:
+          result.fileType === "PDF" ? "application/pdf"
+          : result.fileType?.startsWith("PowerPoint") ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          : result.fileType?.startsWith("Word") ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          : result.fileType?.startsWith("Excel") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          : ""
+        ) && !wantAll) {
+          // file type not requested — skip silently
+          continue;
+        }
+
+        const truncNote = result.truncated ? " _(truncated)_" : "";
+        append(
+          `### [${result.fileType}] ${result.fileName}${truncNote}\n\n${result.text}\n`
+        );
+      }
+
+      // Process pages
+      for (const staged of stagedPages) {
+        if (totalChars >= BUDGET) {
+          budgetReached = true;
+          break;
+        }
+
+        try {
+          const page = await canvas.get<Record<string, unknown>>(
+            `/courses/${params.course_id}/pages/${staged.page_url}`
+          );
+          const body = stripHtml(String(page.body ?? ""));
+          if (!body) continue;
+
+          const capped = body.length > PAGE_CAP ? body.slice(0, PAGE_CAP) + "…" : body;
+          append(`### [Page] ${staged.title}\n\n${capped}\n`);
+        } catch {
+          // skip unavailable pages
+        }
+      }
+
+      // Process assignment descriptions
+      for (const staged of stagedAssignments) {
+        if (totalChars >= BUDGET) {
+          budgetReached = true;
+          break;
+        }
+
+        try {
+          const assignment = await canvas.get<Record<string, unknown>>(
+            `/courses/${params.course_id}/assignments/${staged.content_id}`
+          );
+          const desc = stripHtml(String(assignment.description ?? ""));
+          if (!desc) continue;
+
+          const capped = desc.length > ASSIGNMENT_CAP ? desc.slice(0, ASSIGNMENT_CAP) + "…" : desc;
+          append(`### [Assignment] ${staged.title}\n\n${capped}\n`);
+        } catch {
+          // skip unavailable assignments
+        }
+      }
+
+      // Add remaining file IDs if budget was hit
+      const allRemaining = [
+        ...remainingIds,
+        ...skippedFiles.map((f) => f.content_id),
+      ];
+
+      // --- 5. Assemble output ---
+      const moduleNames = matchedModules.map((m) => String(m.name)).join(", ");
+      const header = [
+        `# Study Materials — ${moduleNames}`,
+        `Course ${params.course_id} · ${cappedFiles.length} file(s) · ${stagedPages.length} page(s)`,
+        "",
+      ].join("\n");
+
+      let body = header + sections.join("\n");
+
+      if (budgetReached || allRemaining.length) {
+        body +=
+          `\n\n---\n_Budget reached: some items were not included. ` +
+          `Use \`canvas_read_file\` with these file IDs for the remaining content: ` +
+          `${allRemaining.join(", ")}_`;
+      }
+
+      return { content: [{ type: "text", text: truncate(body) }] };
     } catch (err) {
       return { content: [{ type: "text", text: handleApiError(err) }] };
     }
