@@ -28,7 +28,7 @@ In Canvas: **Account → Settings → New Access Token**
 ### 2. Install and build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/canvas-student-mcp-server
+git clone https://github.com/colehollander10-netizen/canvas-student-mcp-server
 cd canvas-student-mcp-server
 npm install
 npm run build
